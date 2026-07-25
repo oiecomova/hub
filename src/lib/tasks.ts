@@ -36,22 +36,38 @@ async function getOwnerId(): Promise<string> {
   return owner.id;
 }
 
+async function getContactIdForTask(taskId: string): Promise<string | null> {
+  const client = getHubspotClient();
+  const associations = await client.crm.associations.v4.basicApi.getPage(
+    "tasks",
+    taskId,
+    "contacts"
+  );
+  return associations.results[0]?.toObjectId ?? null;
+}
+
+function buildContactName(
+  firstname?: string | null,
+  lastname?: string | null
+): string {
+  // Contatos deste HubSpot carregam uma tag interna (ex: "C_Mig") como sobrenome; ela não faz parte do nome.
+  const cleanLastname =
+    lastname && lastname.trim().toUpperCase() !== "C_MIG" ? lastname : "";
+  return [firstname, cleanLastname].filter(Boolean).join(" ").trim() || "(sem nome)";
+}
+
 async function getContactsForTasks(
   taskIds: string[]
 ): Promise<Map<string, DailyTaskContact>> {
   const client = getHubspotClient();
 
-  const associationsResult = await client.crm.associations.v4.batchApi.getPage(
-    "tasks",
-    "contacts",
-    { inputs: taskIds.map((id) => ({ id })) }
-  );
-
   const contactIdByTaskId = new Map<string, string>();
-  for (const result of associationsResult.results) {
-    const contactId = result.to[0]?.toObjectId;
-    if (contactId) contactIdByTaskId.set(result._from.id, contactId);
-  }
+  await Promise.all(
+    taskIds.map(async (taskId) => {
+      const contactId = await getContactIdForTask(taskId);
+      if (contactId) contactIdByTaskId.set(taskId, contactId);
+    })
+  );
 
   const contactIds = [...new Set(contactIdByTaskId.values())];
   if (contactIds.length === 0) return new Map();
@@ -68,14 +84,10 @@ async function getContactsForTasks(
   for (const [taskId, contactId] of contactIdByTaskId) {
     const contact = contactById.get(contactId);
     if (!contact) continue;
-    const name =
-      [contact.properties.firstname, contact.properties.lastname]
-        .filter(Boolean)
-        .join(" ") || "(sem nome)";
     const phone = contact.properties.mobilephone || contact.properties.phone;
     contactByTaskId.set(taskId, {
       id: contact.id,
-      name,
+      name: buildContactName(contact.properties.firstname, contact.properties.lastname),
       whatsapp: buildWhatsappLink(phone),
     });
   }
@@ -140,12 +152,7 @@ export async function completeTask(taskId: string, observation?: string): Promis
   const client = getHubspotClient();
 
   if (observation && observation.trim()) {
-    const associations = await client.crm.associations.v4.batchApi.getPage(
-      "tasks",
-      "contacts",
-      { inputs: [{ id: taskId }] }
-    );
-    const contactId = associations.results[0]?.to[0]?.toObjectId;
+    const contactId = await getContactIdForTask(taskId);
     if (contactId) {
       await client.crm.objects.notes.basicApi.create({
         properties: {

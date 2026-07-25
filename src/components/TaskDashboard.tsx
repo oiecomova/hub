@@ -21,7 +21,8 @@ const PRIORITY_ORDER: TaskPriority[] = ["HIGH", "MEDIUM", "LOW", "NONE"];
 
 function formatDueDate(dueDate: string): string {
   if (!dueDate) return "";
-  return new Date(Number(dueDate)).toLocaleString("pt-BR", {
+  // hs_timestamp vem como string ISO (ex: "2026-07-06T13:00:00Z"), não como epoch em milissegundos.
+  return new Date(dueDate).toLocaleString("pt-BR", {
     day: "2-digit",
     month: "2-digit",
     hour: "2-digit",
