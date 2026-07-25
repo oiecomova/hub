@@ -61,13 +61,13 @@ async function getContactsForTasks(
 ): Promise<Map<string, DailyTaskContact>> {
   const client = getHubspotClient();
 
+  // Chamadas sequenciais (não em paralelo) para não estourar o rate limit do HubSpot
+  // (10 requisições/segundo em apps privados).
   const contactIdByTaskId = new Map<string, string>();
-  await Promise.all(
-    taskIds.map(async (taskId) => {
-      const contactId = await getContactIdForTask(taskId);
-      if (contactId) contactIdByTaskId.set(taskId, contactId);
-    })
-  );
+  for (const taskId of taskIds) {
+    const contactId = await getContactIdForTask(taskId);
+    if (contactId) contactIdByTaskId.set(taskId, contactId);
+  }
 
   const contactIds = [...new Set(contactIdByTaskId.values())];
   if (contactIds.length === 0) return new Map();
