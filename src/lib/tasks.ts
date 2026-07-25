@@ -36,16 +36,6 @@ async function getOwnerId(): Promise<string> {
   return owner.id;
 }
 
-async function getContactIdForTask(taskId: string): Promise<string | null> {
-  const client = getHubspotClient();
-  const associations = await client.crm.associations.v4.basicApi.getPage(
-    "tasks",
-    taskId,
-    "contacts"
-  );
-  return associations.results[0]?.toObjectId ?? null;
-}
-
 function buildContactName(
   firstname?: string | null,
   lastname?: string | null
@@ -61,12 +51,20 @@ async function getContactsForTasks(
 ): Promise<Map<string, DailyTaskContact>> {
   const client = getHubspotClient();
 
-  // Chamadas sequenciais (não em paralelo) para não estourar o rate limit do HubSpot
-  // (10 requisições/segundo em apps privados).
+  const associationsResult = await client.crm.associations.v4.batchApi.getPage(
+    "tasks",
+    "contacts",
+    { inputs: taskIds.map((id) => ({ id })) }
+  );
+
+  // Os IDs vêm como number em algumas respostas dessa API, apesar do tipo declarado
+  // ser string — força String() para as chaves do Map baterem de forma confiável.
   const contactIdByTaskId = new Map<string, string>();
-  for (const taskId of taskIds) {
-    const contactId = await getContactIdForTask(taskId);
-    if (contactId) contactIdByTaskId.set(taskId, contactId);
+  for (const result of associationsResult.results) {
+    const contactId = result.to[0]?.toObjectId;
+    if (contactId) {
+      contactIdByTaskId.set(String(result._from.id), String(contactId));
+    }
   }
 
   const contactIds = [...new Set(contactIdByTaskId.values())];
@@ -152,7 +150,12 @@ export async function completeTask(taskId: string, observation?: string): Promis
   const client = getHubspotClient();
 
   if (observation && observation.trim()) {
-    const contactId = await getContactIdForTask(taskId);
+    const associations = await client.crm.associations.v4.batchApi.getPage(
+      "tasks",
+      "contacts",
+      { inputs: [{ id: taskId }] }
+    );
+    const contactId = associations.results[0]?.to[0]?.toObjectId;
     if (contactId) {
       await client.crm.objects.notes.basicApi.create({
         properties: {
@@ -161,7 +164,7 @@ export async function completeTask(taskId: string, observation?: string): Promis
         },
         associations: [
           {
-            to: { id: contactId },
+            to: { id: String(contactId) },
             types: [
               {
                 associationCategory: AssociationSpecAssociationCategoryEnum.HubspotDefined,
