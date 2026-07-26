@@ -1,4 +1,5 @@
 import { getAnthropicClient } from "./anthropic";
+import { parseJsonResponse } from "./ai-json";
 
 export interface AgendaInterpretation {
   tituloTarefa: string;
@@ -50,9 +51,5 @@ export async function interpretAgendaText(params: {
     throw new Error("Resposta da IA não contém texto.");
   }
 
-  try {
-    return JSON.parse(textBlock.text) as AgendaInterpretation;
-  } catch {
-    throw new Error("Não foi possível interpretar o compromisso (JSON inválido).");
-  }
+  return parseJsonResponse<AgendaInterpretation>(textBlock.text);
 }

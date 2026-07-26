@@ -1,4 +1,5 @@
 import { getAnthropicClient } from "./anthropic";
+import { parseJsonResponse } from "./ai-json";
 
 export type NextActivityType = "REUNIAO" | "FOLLOWUP_CADENCIA" | "TAREFA_GENERICA";
 
@@ -66,12 +67,5 @@ Observação do corretor: ${params.observation}`,
     throw new Error("Resposta da IA não contém texto.");
   }
 
-  let parsed: NextActivityDecision;
-  try {
-    parsed = JSON.parse(textBlock.text);
-  } catch {
-    throw new Error("Não foi possível interpretar a decisão da IA (JSON inválido).");
-  }
-
-  return parsed;
+  return parseJsonResponse<NextActivityDecision>(textBlock.text);
 }
