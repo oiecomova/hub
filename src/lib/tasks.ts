@@ -26,37 +26,55 @@ export interface DailyTask {
   contact: DailyTaskContact | null;
 }
 
+// A API de batch do HubSpot (associações e leitura de objetos) aceita no
+// máximo 100 itens por chamada — quebra listas maiores em blocos.
+const HUBSPOT_BATCH_LIMIT = 100;
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
 async function getContactsForTasks(
   taskIds: string[]
 ): Promise<Map<string, DailyTaskContact>> {
   const client = getHubspotClient();
 
-  const associationsResult = await client.crm.associations.v4.batchApi.getPage(
-    "tasks",
-    "contacts",
-    { inputs: taskIds.map((id) => ({ id })) }
-  );
-
   // Os IDs vêm como number em algumas respostas dessa API, apesar do tipo declarado
   // ser string — força String() para as chaves do Map baterem de forma confiável.
   const contactIdByTaskId = new Map<string, string>();
-  for (const result of associationsResult.results) {
-    const contactId = result.to[0]?.toObjectId;
-    if (contactId) {
-      contactIdByTaskId.set(String(result._from.id), String(contactId));
+  for (const taskIdChunk of chunk(taskIds, HUBSPOT_BATCH_LIMIT)) {
+    const associationsResult = await client.crm.associations.v4.batchApi.getPage(
+      "tasks",
+      "contacts",
+      { inputs: taskIdChunk.map((id) => ({ id })) }
+    );
+    for (const result of associationsResult.results) {
+      const contactId = result.to[0]?.toObjectId;
+      if (contactId) {
+        contactIdByTaskId.set(String(result._from.id), String(contactId));
+      }
     }
   }
 
   const contactIds = [...new Set(contactIdByTaskId.values())];
   if (contactIds.length === 0) return new Map();
 
-  const contactsResult = await client.crm.contacts.batchApi.read({
-    inputs: contactIds.map((id) => ({ id })),
-    properties: ["firstname", "lastname", "phone", "mobilephone"],
-    propertiesWithHistory: [],
-  });
-
-  const contactById = new Map(contactsResult.results.map((c) => [c.id, c]));
+  type Contact = Awaited<ReturnType<typeof client.crm.contacts.batchApi.read>>["results"][number];
+  const contactById = new Map<string, Contact>();
+  for (const contactIdChunk of chunk(contactIds, HUBSPOT_BATCH_LIMIT)) {
+    const contactsResult = await client.crm.contacts.batchApi.read({
+      inputs: contactIdChunk.map((id) => ({ id })),
+      properties: ["firstname", "lastname", "phone", "mobilephone"],
+      propertiesWithHistory: [],
+    });
+    for (const contact of contactsResult.results) {
+      contactById.set(contact.id, contact);
+    }
+  }
 
   const contactByTaskId = new Map<string, DailyTaskContact>();
   for (const [taskId, contactId] of contactIdByTaskId) {
