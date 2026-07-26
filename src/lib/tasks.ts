@@ -1,8 +1,11 @@
 import { AssociationTypes } from "@hubspot/api-client";
 import { FilterOperatorEnum } from "@hubspot/api-client/lib/codegen/crm/objects/tasks/models/Filter";
 import { AssociationSpecAssociationCategoryEnum } from "@hubspot/api-client/lib/codegen/crm/objects/notes/models/AssociationSpec";
-import { getHubspotClient } from "./hubspot";
-import { buildWhatsappLink } from "./whatsapp";
+import { getHubspotClient, getOwnerId, buildContactName } from "./hubspot";
+import { buildWhatsappLink, formatBrPhone } from "./whatsapp";
+import { decideNextActivity } from "./followup";
+import { interpretAgendaText } from "./agenda";
+import { searchContactByName } from "./contacts";
 
 export type TaskPriority = "HIGH" | "MEDIUM" | "LOW" | "NONE";
 
@@ -10,6 +13,7 @@ export interface DailyTaskContact {
   id: string;
   name: string;
   whatsapp: string | null;
+  phoneDisplay: string | null;
 }
 
 export interface DailyTask {
@@ -20,30 +24,6 @@ export interface DailyTask {
   dueDate: string;
   isOverdue: boolean;
   contact: DailyTaskContact | null;
-}
-
-async function getOwnerId(): Promise<string> {
-  const email = process.env.HUBSPOT_OWNER_EMAIL;
-  if (!email) {
-    throw new Error("HUBSPOT_OWNER_EMAIL não está configurado no ambiente.");
-  }
-  const client = getHubspotClient();
-  const owners = await client.crm.owners.ownersApi.getPage(email);
-  const owner = owners.results[0];
-  if (!owner) {
-    throw new Error(`Nenhum owner do HubSpot encontrado para o e-mail ${email}.`);
-  }
-  return owner.id;
-}
-
-function buildContactName(
-  firstname?: string | null,
-  lastname?: string | null
-): string {
-  // Contatos deste HubSpot carregam uma tag interna (ex: "C_Mig") como sobrenome; ela não faz parte do nome.
-  const cleanLastname =
-    lastname && lastname.trim().toUpperCase() !== "C_MIG" ? lastname : "";
-  return [firstname, cleanLastname].filter(Boolean).join(" ").trim() || "(sem nome)";
 }
 
 async function getContactsForTasks(
@@ -87,19 +67,17 @@ async function getContactsForTasks(
       id: contact.id,
       name: buildContactName(contact.properties.firstname, contact.properties.lastname),
       whatsapp: buildWhatsappLink(phone),
+      phoneDisplay: formatBrPhone(phone),
     });
   }
   return contactByTaskId;
 }
 
-export async function listDailyTasks(): Promise<DailyTask[]> {
+async function searchOpenTasks(
+  extraFilters: Array<{ propertyName: string; operator: FilterOperatorEnum; value: string }>
+): Promise<DailyTask[]> {
   const client = getHubspotClient();
   const ownerId = await getOwnerId();
-
-  const now = new Date();
-  const endOfToday = new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999)
-  );
 
   const searchResult = await client.crm.objects.tasks.searchApi.doSearch({
     filterGroups: [
@@ -107,11 +85,7 @@ export async function listDailyTasks(): Promise<DailyTask[]> {
         filters: [
           { propertyName: "hubspot_owner_id", operator: FilterOperatorEnum.Eq, value: ownerId },
           { propertyName: "hs_task_status", operator: FilterOperatorEnum.Neq, value: "COMPLETED" },
-          {
-            propertyName: "hs_timestamp",
-            operator: FilterOperatorEnum.Lte,
-            value: String(endOfToday.getTime()),
-          },
+          ...extraFilters,
         ],
       },
     ],
@@ -124,7 +98,7 @@ export async function listDailyTasks(): Promise<DailyTask[]> {
       "hs_timestamp",
       "hs_task_is_overdue",
     ],
-    limit: 100,
+    limit: 200,
   });
 
   const tasks = searchResult.results;
@@ -146,38 +120,186 @@ export async function listDailyTasks(): Promise<DailyTask[]> {
   });
 }
 
-export async function completeTask(taskId: string, observation?: string): Promise<void> {
+export async function listDailyTasks(): Promise<DailyTask[]> {
+  const now = new Date();
+  const endOfToday = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999)
+  );
+
+  return searchOpenTasks([
+    {
+      propertyName: "hs_timestamp",
+      operator: FilterOperatorEnum.Lte,
+      value: String(endOfToday.getTime()),
+    },
+  ]);
+}
+
+/** Todas as tarefas em aberto do owner, sem filtro de data — usado pela Agenda
+ * para agrupar por dia num calendário (inclui atrasadas e futuras). */
+export async function listAgendaTasks(): Promise<DailyTask[]> {
+  return searchOpenTasks([]);
+}
+
+async function getContactIdForTask(taskId: string): Promise<string | null> {
+  const client = getHubspotClient();
+  const associations = await client.crm.associations.v4.batchApi.getPage(
+    "tasks",
+    "contacts",
+    { inputs: [{ id: taskId }] }
+  );
+  const contactId = associations.results[0]?.to[0]?.toObjectId;
+  return contactId ? String(contactId) : null;
+}
+
+export interface CompleteTaskResult {
+  nextTaskCreated: boolean;
+  warning?: string;
+}
+
+export async function completeTask(
+  taskId: string,
+  observation?: string
+): Promise<CompleteTaskResult> {
   const client = getHubspotClient();
 
+  let nextTaskCreated = false;
+  let warning: string | undefined;
+
   if (observation && observation.trim()) {
-    const associations = await client.crm.associations.v4.batchApi.getPage(
-      "tasks",
-      "contacts",
-      { inputs: [{ id: taskId }] }
-    );
-    const contactId = associations.results[0]?.to[0]?.toObjectId;
-    if (contactId) {
-      await client.crm.objects.notes.basicApi.create({
-        properties: {
-          hs_note_body: observation,
-          hs_timestamp: String(Date.now()),
-        },
-        associations: [
-          {
-            to: { id: String(contactId) },
-            types: [
-              {
-                associationCategory: AssociationSpecAssociationCategoryEnum.HubspotDefined,
-                associationTypeId: AssociationTypes.noteToContact,
-              },
-            ],
+    try {
+      const contactId = await getContactIdForTask(taskId);
+
+      if (!contactId) {
+        warning =
+          "Tarefa sem contato associado — não foi possível registrar a nota nem criar a próxima atividade automaticamente.";
+      } else {
+        const [currentTask, contact] = await Promise.all([
+          client.crm.objects.tasks.basicApi.getById(taskId, [
+            "hs_task_subject",
+            "hs_task_body",
+            "hs_task_priority",
+            "hubspot_owner_id",
+          ]),
+          client.crm.contacts.basicApi.getById(contactId, ["firstname", "lastname"]),
+        ]);
+
+        const contactName = buildContactName(
+          contact.properties.firstname,
+          contact.properties.lastname
+        );
+
+        const decision = await decideNextActivity({
+          contactName,
+          currentTaskSubject: currentTask.properties.hs_task_subject ?? "",
+          currentTaskBody: currentTask.properties.hs_task_body ?? "",
+          observation,
+          now: new Date(),
+        });
+
+        await client.crm.objects.notes.basicApi.create({
+          properties: {
+            hs_note_body: decision.resumoNota,
+            hs_timestamp: String(Date.now()),
           },
-        ],
-      });
+          associations: [
+            {
+              to: { id: contactId },
+              types: [
+                {
+                  associationCategory: AssociationSpecAssociationCategoryEnum.HubspotDefined,
+                  associationTypeId: AssociationTypes.noteToContact,
+                },
+              ],
+            },
+          ],
+        });
+
+        const dueDateMs = new Date(decision.dataTarefaIso).getTime();
+        await client.crm.objects.tasks.basicApi.create({
+          properties: {
+            hs_task_subject: decision.tituloTarefa,
+            hs_task_body: decision.descricaoTarefa,
+            hs_timestamp: Number.isFinite(dueDateMs) ? String(dueDateMs) : String(Date.now()),
+            hs_task_priority: currentTask.properties.hs_task_priority ?? "NONE",
+            hs_task_status: "NOT_STARTED",
+            hubspot_owner_id: currentTask.properties.hubspot_owner_id ?? "",
+          },
+          associations: [
+            {
+              to: { id: contactId },
+              types: [
+                {
+                  associationCategory: AssociationSpecAssociationCategoryEnum.HubspotDefined,
+                  associationTypeId: AssociationTypes.taskToContact,
+                },
+              ],
+            },
+          ],
+        });
+        nextTaskCreated = true;
+      }
+    } catch (error) {
+      warning =
+        error instanceof Error
+          ? `Não foi possível gerar a próxima atividade automaticamente: ${error.message}`
+          : "Não foi possível gerar a próxima atividade automaticamente.";
     }
   }
 
   await client.crm.objects.tasks.basicApi.update(taskId, {
     properties: { hs_task_status: "COMPLETED" },
   });
+
+  return { nextTaskCreated, warning };
+}
+
+export interface CreateAgendaTaskResult {
+  taskId: string;
+  subject: string;
+  dueDate: string;
+  contactName: string | null;
+}
+
+export async function createAgendaTask(text: string): Promise<CreateAgendaTaskResult> {
+  const client = getHubspotClient();
+  const ownerId = await getOwnerId();
+
+  const decision = await interpretAgendaText({ text, now: new Date() });
+
+  const contact = decision.contactNameGuess
+    ? await searchContactByName(decision.contactNameGuess)
+    : null;
+
+  const dueDateMs = new Date(decision.dataTarefaIso).getTime();
+  const task = await client.crm.objects.tasks.basicApi.create({
+    properties: {
+      hs_task_subject: decision.tituloTarefa,
+      hs_task_body: decision.descricaoTarefa,
+      hs_timestamp: Number.isFinite(dueDateMs) ? String(dueDateMs) : String(Date.now()),
+      hs_task_priority: "NONE",
+      hs_task_status: "NOT_STARTED",
+      hubspot_owner_id: ownerId,
+    },
+    associations: contact
+      ? [
+          {
+            to: { id: contact.id },
+            types: [
+              {
+                associationCategory: AssociationSpecAssociationCategoryEnum.HubspotDefined,
+                associationTypeId: AssociationTypes.taskToContact,
+              },
+            ],
+          },
+        ]
+      : [],
+  });
+
+  return {
+    taskId: task.id,
+    subject: decision.tituloTarefa,
+    dueDate: task.properties.hs_timestamp ?? decision.dataTarefaIso,
+    contactName: contact?.name ?? null,
+  };
 }

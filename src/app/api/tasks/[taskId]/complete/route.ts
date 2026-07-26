@@ -9,8 +9,8 @@ export async function POST(
   const observation = typeof body.observation === "string" ? body.observation : undefined;
 
   try {
-    await completeTask(taskId, observation);
-    return Response.json({ ok: true });
+    const result = await completeTask(taskId, observation);
+    return Response.json({ ok: true, ...result });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Erro ao concluir tarefa.";
     return Response.json({ error: message }, { status: 500 });

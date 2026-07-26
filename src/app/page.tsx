@@ -1,26 +1,44 @@
-import { listDailyTasks } from "@/lib/tasks";
-import { TaskDashboard } from "@/components/TaskDashboard";
+import { listDailyTasks, listAgendaTasks } from "@/lib/tasks";
+import { getDashboardStats } from "@/lib/dashboard";
+import { listColdContacts } from "@/lib/oferta";
+import { AppShell } from "@/components/AppShell";
 
 export const dynamic = "force-dynamic";
 
-export default async function Home() {
-  let tasks: Awaited<ReturnType<typeof listDailyTasks>> = [];
-  let errorMessage: string | null = null;
-
+async function safe<T>(promise: Promise<T>, fallback: T): Promise<{ data: T; error: string | null }> {
   try {
-    tasks = await listDailyTasks();
+    return { data: await promise, error: null };
   } catch (error) {
-    errorMessage = error instanceof Error ? error.message : "Erro ao carregar tarefas do HubSpot.";
+    return {
+      data: fallback,
+      error: error instanceof Error ? error.message : "Erro ao carregar dados.",
+    };
   }
+}
+
+export default async function Home() {
+  const [tasks, agendaTasks, stats, coldContacts] = await Promise.all([
+    safe(listDailyTasks(), []),
+    safe(listAgendaTasks(), []),
+    safe(
+      getDashboardStats(),
+      { overdueCount: 0, dueTodayCount: 0, completedThisWeekCount: 0, openByPriority: { HIGH: 0, MEDIUM: 0, LOW: 0, NONE: 0 } }
+    ),
+    safe(listColdContacts(), []),
+  ]);
 
   return (
-    <main className="mx-auto flex max-w-2xl flex-col gap-6 px-4 py-8">
-      <h1 className="text-xl font-semibold">Tarefas de hoje</h1>
-      {errorMessage ? (
-        <p className="text-sm text-red-500">{errorMessage}</p>
-      ) : (
-        <TaskDashboard tasks={tasks} />
-      )}
-    </main>
+    <AppShell
+      initialTasks={tasks.data}
+      initialAgendaTasks={agendaTasks.data}
+      initialStats={stats.data}
+      initialColdContacts={coldContacts.data}
+      errors={{
+        tasks: tasks.error,
+        agenda: agendaTasks.error,
+        dashboard: stats.error,
+        oferta: coldContacts.error,
+      }}
+    />
   );
 }
